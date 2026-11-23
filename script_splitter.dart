@@ -54,8 +54,7 @@ List<String> _paragraphChunks(String text, int target) {
 
   final units = <(String, bool)>[];
   for (final p in paras) {
-    final sents = _sentBoundary
-        .split(p)
+    final sents = p.split(_sentBoundary)
         .map((s) => s.trim())
         .where((s) => s.isNotEmpty)
         .toList();
@@ -111,7 +110,7 @@ List<String> _splitLong(String text, int target, int maxChars) {
       text.replaceAll('\r\n', '\n').replaceAll('\r', '\n').trim();
   if (normalized.isEmpty) return [];
 
-  final units = _longUnits.split(normalized);
+  final units = normalized.split(_longUnits);
   final chunks = <String>[];
   var current = '';
 
