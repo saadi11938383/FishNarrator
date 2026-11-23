@@ -1,0 +1,60 @@
+{
+  "as_of": "2026-11-22",
+  "data": [
+    {
+      "id": "heygen/heygen-voice-1-turbo:free",
+      "name": "HeyGen: HeyGen Voice Turbo (free)",
+      "description": "HeyGen Voice Turbo is a lower-latency version of HeyGen Voice, HeyGen's text-to-speech model. It has the same 10 default voices, or bring your own HeyGen key to use voice clones...",
+      "architecture": {
+        "modality": "text->speech",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "speech"
+        ],
+        "tokenizer": "Other",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0",
+        "completion": "0"
+      },
+      "supported_voices": [
+        "nadine",
+        "tabitha",
+        "bram",
+        "gareth",
+        "noelle",
+        "meredith",
+        "sabrina",
+        "lucian",
+        "weston",
+        "vincent"
+      ],
+      "expiration_date": "2026-11-30"
+    },
+    {
+      "id": "fish-audio/s2.1-pro-free:free",
+      "name": "Fish Audio: S2.1 Pro Free (free)",
+      "description": "S2.1 Pro Free is the no-cost variant of Fish Audio S2.1 Pro, intended for testing, prototyping, and low-volume applications. It provides the same synthesis capabilities without production latency or availability...",
+      "architecture": {
+        "modality": "text->speech",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "speech"
+        ],
+        "tokenizer": "Other",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0",
+        "completion": "0"
+      },
+      "supported_voices": null,
+      "expiration_date": null
+    }
+  ]
+}
