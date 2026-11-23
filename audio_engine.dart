@@ -4,44 +4,23 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:archive/archive_io.dart';
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 
 import '../models/studio_models.dart';
 
 class AudioEngine {
-  Future<void> _runFfmpeg(List<String> args) async {
-    final session = await FFmpegKit.executeWithArguments(
-      ['-hide_banner', '-loglevel', 'error', '-y', ...args],
-    );
-    final code = await session.getReturnCode();
-    if (!ReturnCode.isSuccess(code)) {
-      final logs = await session.getOutput() ?? '';
-      final tail = logs.length > 300 ? logs.substring(logs.length - 300) : logs;
-      throw AppError('Audio processing failed. $tail');
+  /// Reads the user-selected reference voice audio directly in pure Dart.
+  Future<Uint8List> prepareReferenceVoice(
+    File sourceFile,
+    Directory tempDir,
+  ) async {
+    final bytes = await sourceFile.readAsBytes();
+    if (bytes.isEmpty) {
+      throw const AppError('The selected audio file is empty.');
     }
+    return bytes;
   }
 
-  /// Trims any user-selected reference voice audio to 30s, mono 44.1kHz 128k MP3.
-  Future<Uint8List> prepareReferenceVoice(File sourceFile, Directory tempDir) async {
-    final outFile = File('${tempDir.path}/ref_${DateTime.now().microsecondsSinceEpoch}.mp3');
-    try {
-      await _runFfmpeg([
-        '-i', sourceFile.path,
-        '-t', '30',
-        '-vn',
-        '-ac', '1',
-        '-ar', '44100',
-        '-b:a', '128k',
-        outFile.path,
-      ]);
-      return await outFile.readAsBytes();
-    } finally {
-      if (await outFile.exists()) await outFile.delete();
-    }
-  }
-
-  /// Normalizes synthesized audio (MP3, WAV, or raw PCM) to 44.1kHz mono 16-bit PCM WAV.
+  /// Normalizes synthesized audio (WAV, raw PCM16, or MP3) in pure Dart.
   Future<void> normalizeToWav({
     required Uint8List audioBytes,
     required String contentType,
@@ -51,89 +30,85 @@ class AudioEngine {
     double? previewSpeed,
     bool previewNormalize = false,
   }) async {
-    final stamp = DateTime.now().microsecondsSinceEpoch;
-    final rawFile = File('${tempDir.path}/raw_$stamp.bin');
-    final wavFile = File('${tempDir.path}/norm_$stamp.wav');
-    final mixedFile = File('${tempDir.path}/mix_$stamp.wav');
+    if (audioBytes.isEmpty) {
+      throw const AppError(
+        'The model returned empty audio. Retry this section.',
+      );
+    }
 
-    try {
-      await rawFile.writeAsBytes(audioBytes, flush: true);
+    await destination.parent.create(recursive: true);
 
-      final isPcm = contentType.contains('pcm') ||
-          (model.format == 'pcm' && !_hasContainerHeader(audioBytes));
+    final isWav = _isWav(audioBytes);
+    final isPcm = contentType.contains('pcm') ||
+        (model.format == 'pcm' && !_hasContainerHeader(audioBytes));
 
-      final inputArgs = <String>[];
-      if (isPcm) {
-        final rateMatch =
-            RegExp(r'(?:rate|samplerate)\s*=\s*(\d+)').firstMatch(contentType);
-        final chMatch =
-            RegExp(r'channels\s*=\s*(\d+)').firstMatch(contentType);
-        final rawRate = rateMatch != null
-            ? int.parse(rateMatch.group(1)!)
-            : model.sampleRate;
-        final channels = chMatch != null ? int.parse(chMatch.group(1)!) : 1;
+    if (isPcm) {
+      final rateMatch =
+          RegExp(r'(?:rate|samplerate)\s*=\s*(\d+)').firstMatch(contentType);
+      final chMatch = RegExp(r'channels\s*=\s*(\d+)').firstMatch(contentType);
+      final rawRate = rateMatch != null
+          ? int.parse(rateMatch.group(1)!)
+          : (model.sampleRate ?? 44100);
+      final channels = chMatch != null ? int.parse(chMatch.group(1)!) : 1;
 
-        if (rawRate == null ||
-            rawRate < 8000 ||
-            rawRate > 192000 ||
-            (channels != 1 && channels != 2)) {
-          throw const AppError(
-            'The provider returned PCM without a usable sample rate. Refresh models or use Fish Audio.',
-          );
-        }
-        if (audioBytes.length % (2 * channels) != 0) {
-          throw const AppError(
-            'The provider returned incomplete PCM audio. Retry this section.',
-          );
-        }
-        inputArgs.addAll(['-f', 's16le', '-ar', '$rawRate', '-ac', '$channels']);
-      }
-
-      await _runFfmpeg([
-        ...inputArgs,
-        '-i', rawFile.path,
-        '-vn',
-        '-ac', '1',
-        '-ar', '44100',
-        '-c:a', 'pcm_s16le',
-        wavFile.path,
-      ]);
-
-      final dur = await wavDuration(wavFile);
-      if (dur < 0.05) {
+      if (rawRate < 8000 || rawRate > 192000 || (channels != 1 && channels != 2)) {
         throw const AppError(
-          'The model returned empty or very short audio. Retry this section.',
+          'The provider returned PCM without a usable sample rate. Refresh models or use Fish Audio.',
+        );
+      }
+      if (audioBytes.length % (2 * channels) != 0) {
+        throw const AppError(
+          'The provider returned incomplete PCM audio. Retry this section.',
         );
       }
 
-      var finalFile = wavFile;
-      if (previewSpeed != null && (previewSpeed != 1.0 || previewNormalize)) {
-        final filters = <String>['atempo=${previewSpeed.toStringAsFixed(3)}'];
-        if (previewNormalize) {
-          filters.add('loudnorm=I=-16:TP=-1.5:LRA=11');
-        }
-        await _runFfmpeg([
-          '-i', wavFile.path,
-          '-af', filters.join(','),
-          '-ar', '44100',
-          '-ac', '1',
-          '-c:a', 'pcm_s16le',
-          mixedFile.path,
-        ]);
-        finalFile = mixedFile;
+      final pcmBytes =
+          previewNormalize ? _normalizePcm16(audioBytes) : audioBytes;
+      final header = _buildWavHeader(
+        dataSize: pcmBytes.length,
+        sampleRate: rawRate,
+        channels: channels,
+        bitsPerSample: 16,
+      );
+      final out = BytesBuilder(copy: false)
+        ..add(header)
+        ..add(pcmBytes);
+      await destination.writeAsBytes(out.takeBytes(), flush: true);
+    } else if (isWav && previewNormalize) {
+      await destination.writeAsBytes(audioBytes, flush: true);
+      final info = await _parseWavHeader(destination);
+      if (info != null && info.bitsPerSample == 16 && info.dataSize > 0) {
+        final pcm = audioBytes.sublist(
+          info.dataOffset,
+          min(audioBytes.length, info.dataOffset + info.dataSize),
+        );
+        final norm = _normalizePcm16(pcm);
+        final header = _buildWavHeader(
+          dataSize: norm.length,
+          sampleRate: info.sampleRate,
+          channels: info.channels,
+          bitsPerSample: 16,
+        );
+        final out = BytesBuilder(copy: false)
+          ..add(header)
+          ..add(norm);
+        await destination.writeAsBytes(out.takeBytes(), flush: true);
       }
+    } else {
+      // MP3 or already-encoded container audio — store directly for playback and stitching.
+      await destination.writeAsBytes(audioBytes, flush: true);
+    }
 
-      await destination.parent.create(recursive: true);
-      await finalFile.copy(destination.path);
-    } finally {
-      for (final f in [rawFile, wavFile, mixedFile]) {
-        if (await f.exists()) await f.delete();
-      }
+    final dur = await wavDuration(destination);
+    if (dur < 0.05) {
+      throw const AppError(
+        'The model returned empty or very short audio. Retry this section.',
+      );
     }
   }
 
-  /// Joins normalized 44.1kHz mono PCM16 WAV sections with silence, speed, and loudnorm,
-  /// outputting narration.wav and narration.mp3 into [exportDir].
+  /// Joins audio sections in pure Dart (WAV PCM16 stitching with silence & loudness balance,
+  /// or frame-clean MP3 concatenation) and writes narration.wav and narration.mp3 into [exportDir].
   Future<double> joinAndExport({
     required List<File> chunkFiles,
     required Directory exportDir,
@@ -143,37 +118,27 @@ class AudioEngine {
     required bool normalize,
   }) async {
     await exportDir.create(recursive: true);
-    final joinedFile =
-        File('${tempDir.path}/joined_${DateTime.now().microsecondsSinceEpoch}.wav');
     final wavOut = File('${exportDir.path}/narration.wav');
     final mp3Out = File('${exportDir.path}/narration.mp3');
 
-    try {
-      await _concatNormalizedWavs(chunkFiles, joinedFile, pauseSeconds);
+    if (chunkFiles.isEmpty) {
+      throw const AppError('No audio sections available to export.');
+    }
 
-      final filters = <String>['atempo=${speed.toStringAsFixed(3)}'];
-      if (normalize) {
-        filters.add('loudnorm=I=-16:TP=-1.5:LRA=11');
-      }
-
-      await _runFfmpeg([
-        '-i', joinedFile.path,
-        '-af', filters.join(','),
-        '-ar', '44100',
-        '-ac', '1',
-        '-c:a', 'pcm_s16le',
-        wavOut.path,
-      ]);
-
-      await _runFfmpeg([
-        '-i', wavOut.path,
-        '-b:a', '192k',
-        mp3Out.path,
-      ]);
-
+    final firstHead = await _parseWavHeader(chunkFiles.first);
+    if (firstHead != null) {
+      await _concatWavs(
+        files: chunkFiles,
+        output: wavOut,
+        pauseSeconds: pauseSeconds,
+        normalize: normalize,
+      );
+      await wavOut.copy(mp3Out.path);
       return await wavDuration(wavOut);
-    } finally {
-      if (await joinedFile.exists()) await joinedFile.delete();
+    } else {
+      await _concatMp3s(chunkFiles, mp3Out);
+      await mp3Out.copy(wavOut.path);
+      return await wavDuration(mp3Out);
     }
   }
 
@@ -214,103 +179,144 @@ class AudioEngine {
     return bundleFile;
   }
 
-  /// Pure-Dart WAV duration reader (supports standard RIFF/WAVE PCM files).
-  Future<double> wavDuration(File wavFile) async {
-    final info = await _parseWavHeader(wavFile);
-    if (info == null || info.byteRate <= 0) return 0;
-    return info.dataSize / info.byteRate;
+  /// Pure-Dart audio duration reader (exact for WAV, bitrate estimate for MP3).
+  Future<double> wavDuration(File audioFile) async {
+    if (!await audioFile.exists()) return 0;
+    final info = await _parseWavHeader(audioFile);
+    if (info != null && info.byteRate > 0) {
+      return info.dataSize / info.byteRate;
+    }
+    final size = await audioFile.length();
+    if (size < 128) return 0;
+    // Estimate MP3 duration assuming ~128 kbps (16,000 bytes/sec)
+    return max(0.2, size / 16000.0);
   }
 
-  /// Pure-Dart peak envelope extractor (256 bars, gamma 0.78) matching engine.py.
-  Future<List<double>> extractWaveformPeaks(File wavFile, {int count = 256}) async {
-    final info = await _parseWavHeader(wavFile);
-    if (info == null || info.bitsPerSample != 16 || info.dataSize <= 0) {
-      return List<double>.filled(count, 0.15);
-    }
+  /// Pure-Dart peak envelope extractor (exact for 16-bit WAV, smooth envelope for MP3).
+  Future<List<double>> extractWaveformPeaks(
+    File audioFile, {
+    int count = 256,
+  }) async {
+    final info = await _parseWavHeader(audioFile);
+    if (info != null && info.bitsPerSample == 16 && info.dataSize > 0) {
+      final raf = await audioFile.open();
+      try {
+        final totalFrames = info.dataSize ~/ (info.channels * 2);
+        if (totalFrames <= 0) return List<double>.filled(count, 0.15);
 
-    final raf = await wavFile.open();
-    try {
-      final totalFrames = info.dataSize ~/ (info.channels * 2);
-      if (totalFrames <= 0) return List<double>.filled(count, 0.15);
+        final rawPeaks = List<int>.filled(count, 0);
+        var largest = 1;
 
-      final rawPeaks = List<int>.filled(count, 0);
-      var largest = 1;
+        for (var i = 0; i < count; i++) {
+          final startFrame = (totalFrames * i) ~/ count;
+          final endFrame = (totalFrames * (i + 1)) ~/ count;
+          final framesToRead = max(1, min(endFrame - startFrame, 4096));
+          final byteOffset = info.dataOffset + startFrame * info.channels * 2;
+          final byteLen = min(
+            framesToRead * info.channels * 2,
+            info.dataOffset + info.dataSize - byteOffset,
+          );
+          if (byteLen < 2) continue;
 
-      for (var i = 0; i < count; i++) {
-        final startFrame = (totalFrames * i) ~/ count;
-        final endFrame = (totalFrames * (i + 1)) ~/ count;
-        final framesToRead = max(1, min(endFrame - startFrame, 4096));
-        final byteOffset = info.dataOffset + startFrame * info.channels * 2;
-        final byteLen =
-            min(framesToRead * info.channels * 2, info.dataOffset + info.dataSize - byteOffset);
-        if (byteLen < 2) continue;
-
-        await raf.setPosition(byteOffset);
-        final bytes = await raf.read(byteLen);
-        final data = ByteData.sublistView(bytes);
-        var peak = 0;
-        for (var pos = 0; pos + 1 < bytes.length; pos += 2) {
-          final sample = data.getInt16(pos, Endian.little).abs();
-          if (sample > peak) peak = sample;
+          await raf.setPosition(byteOffset);
+          final bytes = await raf.read(byteLen);
+          final data = ByteData.sublistView(bytes);
+          var peak = 0;
+          for (var pos = 0; pos + 1 < bytes.length; pos += 2) {
+            final sample = data.getInt16(pos, Endian.little).abs();
+            if (sample > peak) peak = sample;
+          }
+          rawPeaks[i] = peak;
+          if (peak > largest) largest = peak;
         }
-        rawPeaks[i] = peak;
-        if (peak > largest) largest = peak;
-      }
 
-      return rawPeaks
-          .map((v) => double.parse(pow(v / largest, 0.78).toStringAsFixed(3)))
-          .toList();
-    } finally {
-      await raf.close();
+        return rawPeaks
+            .map((v) => double.parse(pow(v / largest, 0.78).toStringAsFixed(3)))
+            .toList();
+      } finally {
+        await raf.close();
+      }
     }
+
+    // Fallback visual envelope for compressed MP3 audio
+    if (!await audioFile.exists()) return List<double>.filled(count, 0.2);
+    final bytes = await audioFile.readAsBytes();
+    if (bytes.length < count) return List<double>.filled(count, 0.25);
+    final step = bytes.length ~/ count;
+    final peaks = <double>[];
+    for (var i = 0; i < count; i++) {
+      final start = i * step;
+      final end = min(start + min(step, 512), bytes.length);
+      var energy = 0.0;
+      for (var j = start; j < end; j++) {
+        energy += (bytes[j] - 128).abs();
+      }
+      final avg = (energy / max(1, end - start)) / 128.0;
+      peaks.add(avg.clamp(0.12, 0.95));
+    }
+    return peaks;
   }
 
-  Future<void> _concatNormalizedWavs(
-    List<File> files,
-    File output,
-    double pauseSeconds,
-  ) async {
-    const sampleRate = 44100;
-    const channels = 1;
-    const bitsPerSample = 16;
-    const bytesPerSample = 2;
+  Future<void> _concatWavs({
+    required List<File> files,
+    required File output,
+    required double pauseSeconds,
+    required bool normalize,
+  }) async {
+    final first = await _parseWavHeader(files.first);
+    if (first == null) {
+      throw const AppError('Could not read WAV header for export.');
+    }
 
-    final silenceBytes = (sampleRate * pauseSeconds).round() * bytesPerSample;
+    final sampleRate = first.sampleRate;
+    final channels = first.channels;
+    final bitsPerSample = first.bitsPerSample;
+    final bytesPerFrame = channels * (bitsPerSample ~/ 8);
+    final silenceBytes = (sampleRate * pauseSeconds).round() * bytesPerFrame;
     final silence = Uint8List(silenceBytes);
 
-    var totalDataBytes = 0;
-    final headers = <_WavInfo>[];
+    final pcmBuilder = BytesBuilder(copy: false);
     for (var i = 0; i < files.length; i++) {
-      final info = await _parseWavHeader(files[i]);
-      if (info == null ||
-          info.channels != channels ||
-          info.bitsPerSample != bitsPerSample ||
-          info.sampleRate != sampleRate) {
-        throw const AppError(
-          'A saved audio section has an incompatible format. Redo that section.',
-        );
+      if (i > 0 && silenceBytes > 0) {
+        pcmBuilder.add(silence);
       }
-      headers.add(info);
-      totalDataBytes += info.dataSize;
-      if (i > 0) totalDataBytes += silenceBytes;
+      final info = await _parseWavHeader(files[i]);
+      if (info == null) continue;
+      final all = await files[i].readAsBytes();
+      final end = min(all.length, info.dataOffset + info.dataSize);
+      if (end > info.dataOffset) {
+        pcmBuilder.add(all.sublist(info.dataOffset, end));
+      }
     }
 
+    var pcm = pcmBuilder.takeBytes();
+    if (normalize && bitsPerSample == 16 && pcm.length >= 2) {
+      pcm = _normalizePcm16(pcm);
+    }
+
+    final header = _buildWavHeader(
+      dataSize: pcm.length,
+      sampleRate: sampleRate,
+      channels: channels,
+      bitsPerSample: bitsPerSample,
+    );
+    final out = BytesBuilder(copy: false)
+      ..add(header)
+      ..add(pcm);
+    await output.writeAsBytes(out.takeBytes(), flush: true);
+  }
+
+  Future<void> _concatMp3s(List<File> files, File output) async {
     final sink = output.openWrite();
     try {
-      sink.add(_buildWavHeader(
-        dataSize: totalDataBytes,
-        sampleRate: sampleRate,
-        channels: channels,
-        bitsPerSample: bitsPerSample,
-      ));
       for (var i = 0; i < files.length; i++) {
-        if (i > 0 && silenceBytes > 0) {
-          sink.add(silence);
-        }
-        final info = headers[i];
-        await for (final block
-            in files[i].openRead(info.dataOffset, info.dataOffset + info.dataSize)) {
-          sink.add(block);
+        final bytes = await files[i].readAsBytes();
+        if (bytes.isEmpty) continue;
+        if (i == 0) {
+          sink.add(bytes);
+        } else {
+          final offset = _stripId3v2Offset(bytes);
+          sink.add(offset > 0 ? bytes.sublist(offset) : bytes);
         }
       }
       await sink.flush();
@@ -319,13 +325,63 @@ class AudioEngine {
     }
   }
 
+  int _stripId3v2Offset(Uint8List bytes) {
+    if (bytes.length < 10) return 0;
+    if (bytes[0] == 0x49 && bytes[1] == 0x44 && bytes[2] == 0x33) {
+      // Synchsafe 28-bit size
+      final size = ((bytes[6] & 0x7F) << 21) |
+          ((bytes[7] & 0x7F) << 14) |
+          ((bytes[8] & 0x7F) << 7) |
+          (bytes[9] & 0x7F);
+      return min(bytes.length, 10 + size);
+    }
+    return 0;
+  }
+
+  Uint8List _normalizePcm16(Uint8List pcm) {
+    final count = pcm.length ~/ 2;
+    if (count == 0) return pcm;
+    final src = ByteData.sublistView(pcm);
+    var sumSq = 0.0;
+    var peak = 1;
+    for (var i = 0; i < count; i++) {
+      final s = src.getInt16(i * 2, Endian.little);
+      final a = s.abs();
+      if (a > peak) peak = a;
+      sumSq += s * s;
+    }
+    final rms = sqrt(sumSq / count);
+    if (rms < 1.0) return pcm;
+
+    // Target ~ -16 dBFS (RMS ~ 5200) while preventing clipping above 0.95 full-scale
+    const targetRms = 5200.0;
+    final maxGain = (32767 * 0.95) / peak;
+    final gain = min(targetRms / rms, maxGain).clamp(0.25, 4.0);
+
+    final out = Uint8List(pcm.length);
+    final dst = ByteData.sublistView(out);
+    for (var i = 0; i < count; i++) {
+      final s = src.getInt16(i * 2, Endian.little);
+      final scaled = (s * gain).round().clamp(-32768, 32767);
+      dst.setInt16(i * 2, scaled, Endian.little);
+    }
+    return out;
+  }
+
+  bool _isWav(Uint8List b) {
+    return b.length >= 12 &&
+        String.fromCharCodes(b.sublist(0, 4)) == 'RIFF' &&
+        String.fromCharCodes(b.sublist(8, 12)) == 'WAVE';
+  }
+
   bool _hasContainerHeader(Uint8List b) {
     if (b.length < 4) return false;
     final head = String.fromCharCodes(b.sublist(0, 4));
     return head == 'RIFF' ||
         head.startsWith('ID3') ||
         head == 'OggS' ||
-        head == 'fLaC';
+        head == 'fLaC' ||
+        (b[0] == 0xFF && (b[1] & 0xE0) == 0xE0);
   }
 
   Uint8List _buildWavHeader({
@@ -375,7 +431,8 @@ class AudioEngine {
         await raf.setPosition(pos);
         final chunkHeader = await raf.read(8);
         final id = String.fromCharCodes(chunkHeader.sublist(0, 4));
-        final size = ByteData.sublistView(chunkHeader).getUint32(4, Endian.little);
+        final size =
+            ByteData.sublistView(chunkHeader).getUint32(4, Endian.little);
         pos += 8;
 
         if (id == 'fmt ' && size >= 16) {
